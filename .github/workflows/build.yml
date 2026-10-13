@@ -1,0 +1,2031 @@
+name: build
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.8
+
+      - name: Dosyaları oluştur
+        run: |
+          mkdir -p src/main/java/com/hvh/mixin src/main/resources
+
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  maven { name = 'Fabric'; url = 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'fabric-loom' version '1.6-SNAPSHOT'
+          }
+          version = '1.0.0'
+          group = 'com.hvh'
+          base { archivesName = 'HVH-Client' }
+          loom {
+              accessWidenerPath = file("src/main/resources/hvhclient.accesswidener")
+          }
+          dependencies {
+              minecraft "com.mojang:minecraft:1.20.1"
+              mappings "net.fabricmc:yarn:1.20.1+build.10:v2"
+              modImplementation "net.fabricmc:fabric-loader:0.15.11"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:0.92.2+1.20.1"
+          }
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") { expand "version": project.version }
+          }
+          tasks.withType(JavaCompile).configureEach { it.options.release = 17 }
+          java {
+              sourceCompatibility = JavaVersion.VERSION_17
+              targetCompatibility = JavaVersion.VERSION_17
+          }
+          EOF
+
+          cat > src/main/resources/fabric.mod.json <<'EOF'
+          {
+            "schemaVersion": 1,
+            "id": "hvhclient",
+            "version": "${version}",
+            "name": "HVH Client",
+            "environment": "client",
+            "entrypoints": { "client": ["com.hvh.HvhClient"] },
+            "mixins": ["hvhclient.mixins.json"],
+            "accessWidener": "hvhclient.accesswidener",
+            "depends": {
+              "fabricloader": ">=0.14.0",
+              "minecraft": "1.20.1",
+              "java": ">=17",
+              "fabric-api": "*"
+            }
+          }
+          EOF
+
+          cat > src/main/resources/hvhclient.accesswidener <<'EOF'
+          accessWidener v2 named
+          accessible field net/minecraft/client/gui/screen/ingame/HandledScreen focusedSlot Lnet/minecraft/screen/slot/Slot;
+          EOF
+
+          cat > src/main/resources/hvhclient.mixins.json <<'EOF'
+          {
+            "required": true,
+            "minVersion": "0.8",
+            "package": "com.hvh.mixin",
+            "compatibilityLevel": "JAVA_17",
+            "client": ["HeldItemRendererMixin"],
+            "injectors": { "defaultRequire": 1 }
+          }
+          EOF
+
+          cat > src/main/java/com/hvh/Setting.java <<'EOF'
+          package com.hvh;
+
+          public abstract class Setting {
+              public final String name;
+
+              protected Setting(String name) {
+                  this.name = name;
+              }
+
+              public static class Bool extends Setting {
+                  public boolean value;
+
+                  public Bool(String name, boolean def) {
+                      super(name);
+                      this.value = def;
+                  }
+              }
+
+              public static class Num extends Setting {
+                  public double value, min, max, step;
+                  public boolean infiniteTop = false;
+
+                  public Num(String name, double def, double min, double max, double step) {
+                      super(name);
+                      this.value = def;
+                      this.min = min;
+                      this.max = max;
+                      this.step = step;
+                  }
+
+                  public Num infinite() {
+                      infiniteTop = true;
+                      return this;
+                  }
+
+                  public void change(int dir) {
+                      double v = value + dir * step;
+                      v = Math.round(v / step) * step;
+                      value = Math.max(min, Math.min(max, v));
+                  }
+
+                  public double fraction() {
+                      if (max <= min) return 0;
+                      return Math.max(0, Math.min(1, (value - min) / (max - min)));
+                  }
+
+                  public void setFraction(double f) {
+                      f = Math.max(0, Math.min(1, f));
+                      double v = min + f * (max - min);
+                      v = Math.round(v / step) * step;
+                      value = Math.max(min, Math.min(max, v));
+                  }
+              }
+
+              public static class Button extends Setting {
+                  public final Runnable action;
+
+                  public Button(String name, Runnable action) {
+                      super(name);
+                      this.action = action;
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/hvh/Mod.java <<'EOF'
+          package com.hvh;
+
+          import java.util.ArrayList;
+          import java.util.List;
+          import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderContext;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.gui.DrawContext;
+
+          public abstract class Mod {
+              public final String name;
+              public final String category;
+              public boolean enabled = false;
+              public boolean toggleable = true;
+              public boolean listed = true;
+              public boolean expanded = true;
+              public int bind = -1;
+              public final List<Setting> settings = new ArrayList<>();
+
+              protected Mod(String name, String category) {
+                  this.name = name;
+                  this.category = category;
+              }
+
+              protected <T extends Setting> T add(T s) {
+                  settings.add(s);
+                  return s;
+              }
+
+              public void toggle() {
+                  enabled = !enabled;
+              }
+
+              public void onTick(MinecraftClient mc) {}
+
+              public void onFrame(MinecraftClient mc, float dt) {}
+
+              public void onRender(WorldRenderContext ctx) {}
+
+              public void onHud(DrawContext ctx) {}
+          }
+          EOF
+
+          cat > src/main/java/com/hvh/TriggerBot.java <<'EOF'
+          package com.hvh;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.entity.Entity;
+          import net.minecraft.entity.LivingEntity;
+          import net.minecraft.entity.player.PlayerEntity;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.item.Items;
+          import net.minecraft.network.packet.c2s.play.UpdateSelectedSlotC2SPacket;
+          import net.minecraft.util.Hand;
+          import net.minecraft.util.hit.EntityHitResult;
+          import net.minecraft.util.hit.HitResult;
+
+          public class TriggerBot extends Mod {
+              public final Setting.Bool serverCooldown = add(new Setting.Bool("Server Cooldown", true));
+              public final Setting.Num minCooldown = add(new Setting.Num("Cooldown %", 100, 50, 100, 5));
+              public final Setting.Num delay = add(new Setting.Num("Delay (tick)", 10, 0, 20, 1));
+              public final Setting.Bool onlyPlayers = add(new Setting.Bool("Only Players", true));
+              public final Setting.Bool onlyWeapons = add(new Setting.Bool("Only Weapons", true));
+              public final Setting.Bool preHit = add(new Setting.Bool("PreHit (Rocket)", false));
+              public final Setting.Button weaponsMenu = add(new Setting.Button("Weapons Menu", () -> {
+                  MinecraftClient mc = MinecraftClient.getInstance();
+                  mc.setScreen(new WeaponsScreen(mc.currentScreen));
+              }));
+
+              private int ticks = 0;
+
+              public TriggerBot() {
+                  super("TriggerBot", "Combat");
+              }
+
+              @Override
+              public void onTick(MinecraftClient mc) {
+                  ticks++;
+                  if (mc.player == null || mc.world == null || mc.interactionManager == null) return;
+                  if (mc.currentScreen != null) return;
+
+                  HitResult hr = mc.crosshairTarget;
+                  if (!(hr instanceof EntityHitResult)) return;
+                  Entity e = ((EntityHitResult) hr).getEntity();
+                  if (!(e instanceof LivingEntity) || !e.isAlive() || e == mc.player) return;
+                  if (onlyPlayers.value && !(e instanceof PlayerEntity)) return;
+                  if (e instanceof PlayerEntity pe && pe.isSpectator()) return;
+                  if (Friends.ignored(e)) return;
+
+                  ItemStack held = mc.player.getMainHandStack();
+                  boolean pre = preHit.value && held.isOf(Items.FIREWORK_ROCKET);
+
+                  if (!pre && onlyWeapons.value && !HvhClient.weapons.contains(held.getItem())) return;
+                  if (mc.player.isUsingItem()) return;
+
+                  if (!pre) {
+                      if (serverCooldown.value) {
+                          if (mc.player.getAttackCooldownProgress(0.5f) < minCooldown.value / 100.0) return;
+                      } else if (ticks < (int) delay.value) {
+                          return;
+                      }
+                  }
+
+                  mc.interactionManager.attackEntity(mc.player, e);
+                  mc.player.swingHand(Hand.MAIN_HAND);
+                  ticks = 0;
+
+                  if (pre) switchToWeapon(mc);
+              }
+
+              private void switchToWeapon(MinecraftClient mc) {
+                  if (mc.player == null || mc.getNetworkHandler() == null) return;
+                  for (int i = 0; i < 9; i++) {
+                      ItemStack s = mc.player.getInventory().getStack(i);
+                      if (!s.isEmpty() && HvhClient.weapons.contains(s.getItem())) {
+                          if (mc.player.getInventory().selectedSlot != i) {
+                              mc.player.getInventory().selectedSlot = i;
+                              mc.getNetworkHandler().sendPacket(new UpdateSelectedSlotC2SPacket(i));
+                          }
+                          return;
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/hvh/AimAssist.java <<'EOF'
+          package com.hvh;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.network.ClientPlayerEntity;
+          import net.minecraft.entity.player.PlayerEntity;
+          import net.minecraft.util.math.MathHelper;
+          import net.minecraft.util.math.Vec3d;
+
+          public class AimAssist extends Mod {
+              public final Setting.Num range = add(new Setting.Num("Range", 5.0, 1, 8.5, 0.5).infinite());
+              public final Setting.Num fov = add(new Setting.Num("FOV", 90, 10, 360, 10));
+              public final Setting.Num speed = add(new Setting.Num("Speed", 5, 1, 20, 1));
+              public final Setting.Bool vertical = add(new Setting.Bool("Vertical", true));
+              public final Setting.Bool onlyClick = add(new Setting.Bool("Only On Click", true));
+
+              public AimAssist() {
+                  super("AimAssist", "Combat");
+              }
+
+              @Override
+              public void onFrame(MinecraftClient mc, float dt) {
+                  ClientPlayerEntity p = mc.player;
+                  if (p == null || mc.world == null || mc.currentScreen != null) return;
+                  if (onlyClick.value && !mc.options.attackKey.isPressed()) return;
+
+                  boolean inf = range.value >= range.max;
+                  Vec3d eye = p.getEyePos();
+                  double bestAngle = fov.value / 2.0;
+                  float[] best = null;
+
+                  for (PlayerEntity t : mc.world.getPlayers()) {
+                      if (t == p || !t.isAlive() || t.isSpectator()) continue;
+                      if (Friends.ignored(t)) continue;
+                      if (!inf && p.distanceTo(t) > range.value) continue;
+
+                      Vec3d aim = t.getBoundingBox().getCenter();
+                      double dx = aim.x - eye.x;
+                      double dy = aim.y - eye.y;
+                      double dz = aim.z - eye.z;
+                      float yaw = (float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0);
+                      float pitch = (float) -Math.toDegrees(Math.atan2(dy, Math.sqrt(dx * dx + dz * dz)));
+                      float dyaw = MathHelper.wrapDegrees(yaw - p.getYaw());
+                      float dpitch = pitch - p.getPitch();
+                      double ang = Math.sqrt(dyaw * dyaw + dpitch * dpitch);
+                      if (ang <= bestAngle) {
+                          bestAngle = ang;
+                          best = new float[] { dyaw, dpitch };
+                      }
+                  }
+                  if (best == null) return;
+
+                  float k = (float) Math.min(1.0, speed.value * dt);
+                  p.setYaw(p.getYaw() + best[0] * k);
+                  if (vertical.value) {
+                      p.setPitch(MathHelper.clamp(p.getPitch() + best[1] * k, -90f, 90f));
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/hvh/HoverTotem.java <<'EOF'
+          package com.hvh;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.gui.screen.ingame.HandledScreen;
+          import net.minecraft.item.Items;
+          import net.minecraft.screen.slot.Slot;
+          import net.minecraft.screen.slot.SlotActionType;
+
+          public class HoverTotem extends Mod {
+              public final Setting.Num delay = add(new Setting.Num("Delay (tick)", 0, 0, 10, 1));
+              public final Setting.Num target = add(new Setting.Num("Slot (0=Offhand)", 0, 0, 9, 1));
+
+              private int wait = 0;
+
+              public HoverTotem() {
+                  super("HoverTotem", "Combat");
+              }
+
+              @Override
+              public void onTick(MinecraftClient mc) {
+                  if (mc.player == null || mc.interactionManager == null) return;
+                  if (!(mc.currentScreen instanceof HandledScreen<?> hs)) {
+                      wait = 0;
+                      return;
+                  }
+                  Slot slot = hs.focusedSlot;
+                  if (slot == null || slot.inventory != mc.player.getInventory()) return;
+                  int idx = slot.getIndex();
+                  if (idx >= 36) return;
+                  if (!slot.getStack().isOf(Items.TOTEM_OF_UNDYING)) {
+                      wait = 0;
+                      return;
+                  }
+
+                  int t = (int) target.value;
+                  if (t == 0) {
+                      if (mc.player.getOffHandStack().isOf(Items.TOTEM_OF_UNDYING)) return;
+                  } else {
+                      if (idx == t - 1) return;
+                      if (mc.player.getInventory().getStack(t - 1).isOf(Items.TOTEM_OF_UNDYING)) return;
+                  }
+
+                  if (wait < (int) delay.value) {
+                      wait++;
+                      return;
+                  }
+                  wait = 0;
+
+                  int button = t == 0 ? 40 : t - 1;
+                  mc.interactionManager.clickSlot(hs.getScreenHandler().syncId, slot.id, button, SlotActionType.SWAP, mc.player);
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/hvh/Nametags.java <<'EOF'
+          package com.hvh;
+
+          import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderContext;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.font.TextRenderer;
+          import net.minecraft.client.render.Camera;
+          import net.minecraft.client.render.VertexConsumerProvider;
+          import net.minecraft.client.util.math.MatrixStack;
+          import net.minecraft.entity.player.PlayerEntity;
+          import net.minecraft.text.Style;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.math.MathHelper;
+          import net.minecraft.util.math.Vec3d;
+
+          public class Nametags extends Mod {
+              public final Setting.Bool health = add(new Setting.Bool("Health", true));
+              public final Setting.Bool self = add(new Setting.Bool("Self", false));
+              public final Setting.Num scale = add(new Setting.Num("Scale", 1.0, 0.5, 3.0, 0.25));
+
+              public Nametags() {
+                  super("Nametags", "Render");
+              }
+
+              @Override
+              public void onRender(WorldRenderContext ctx) {
+                  MinecraftClient mc = MinecraftClient.getInstance();
+                  if (mc.world == null || mc.player == null) return;
+
+                  Camera cam = ctx.camera();
+                  Vec3d cp = cam.getPos();
+                  MatrixStack ms = ctx.matrixStack();
+                  TextRenderer tr = mc.textRenderer;
+                  VertexConsumerProvider.Immediate vc = mc.getBufferBuilders().getEntityVertexConsumers();
+                  float td = ctx.tickDelta();
+
+                  for (PlayerEntity pl : mc.world.getPlayers()) {
+                      if (pl == mc.player && !self.value) continue;
+                      if (!pl.isAlive() || pl.isSpectator()) continue;
+
+                      double x = MathHelper.lerp(td, pl.prevX, pl.getX()) - cp.x;
+                      double y = MathHelper.lerp(td, pl.prevY, pl.getY()) - cp.y + pl.getHeight() + 0.5;
+                      double z = MathHelper.lerp(td, pl.prevZ, pl.getZ()) - cp.z;
+                      double dist = Math.sqrt(x * x + y * y + z * z);
+
+                      Text base = Friends.is(pl)
+                              ? Text.literal(pl.getName().getString()).setStyle(Style.EMPTY.withColor(0x55FF55))
+                              : pl.getName();
+                      Text text = base;
+                      if (health.value) {
+                          float hp = pl.getHealth() + pl.getAbsorptionAmount();
+                          float ratio = hp / pl.getMaxHealth();
+                          int col = ratio > 0.66f ? 0x55FF55 : ratio > 0.33f ? 0xFFFF55 : 0xFF5555;
+                          text = Text.literal("").append(base)
+                                  .append(Text.literal(String.format(" %.1f", hp)).setStyle(Style.EMPTY.withColor(col)));
+                      }
+
+                      float s = (float) (0.025 * scale.value * Math.max(1.0, dist / 6.0));
+                      ms.push();
+                      ms.translate(x, y, z);
+                      ms.multiply(cam.getRotation());
+                      ms.scale(-s, -s, s);
+                      float w = tr.getWidth(text);
+                      tr.draw(text, -w / 2f, 0, 0xFFFFFFFF, false, ms.peek().getPositionMatrix(), vc,
+                              TextRenderer.TextLayerType.SEE_THROUGH, 0x66000000, 0xF000F0);
+                      vc.draw();
+                      ms.pop();
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/hvh/Hud.java <<'EOF'
+          package com.hvh;
+
+          import java.util.ArrayList;
+          import java.util.List;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.font.TextRenderer;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.util.math.MatrixStack;
+          import net.minecraft.entity.LivingEntity;
+          import net.minecraft.util.math.MathHelper;
+
+          public class Hud extends Mod {
+              public final Setting.Bool watermark = add(new Setting.Bool("Watermark", true));
+              public final Setting.Num wmScale = add(new Setting.Num("WM Scale", 1.0, 0.5, 3.0, 0.1));
+              public final Setting.Num wmX = add(new Setting.Num("WM X %", 1, 0, 100, 1));
+              public final Setting.Num wmY = add(new Setting.Num("WM Y %", 1, 0, 100, 1));
+
+              public final Setting.Bool modList = add(new Setting.Bool("Module List", true));
+              public final Setting.Num listScale = add(new Setting.Num("List Scale", 1.0, 0.5, 3.0, 0.1));
+              public final Setting.Num listX = add(new Setting.Num("List X %", 1, 0, 100, 1));
+              public final Setting.Num listY = add(new Setting.Num("List Y %", 6, 0, 100, 1));
+
+              public final Setting.Bool targetHud = add(new Setting.Bool("TargetHUD", true));
+              public final Setting.Num tScale = add(new Setting.Num("Target Scale", 1.0, 0.5, 3.0, 0.1));
+              public final Setting.Num tX = add(new Setting.Num("Target X %", 50, 0, 100, 1));
+              public final Setting.Num tY = add(new Setting.Num("Target Y %", 60, 0, 100, 1));
+
+              private LivingEntity lastTarget = null;
+              private long lastTime = 0;
+
+              public Hud() {
+                  super("HUD", "Render");
+                  enabled = true;
+                  listed = false;
+              }
+
+              private void place(DrawContext ctx, double xp, double yp, double scale, int w, int h, Runnable draw) {
+                  float s = (float) scale;
+                  int sw = ctx.getScaledWindowWidth();
+                  int sh = ctx.getScaledWindowHeight();
+                  float x = Math.max(0f, (sw - w * s) * (float) xp / 100f);
+                  float y = Math.max(0f, (sh - h * s) * (float) yp / 100f);
+                  MatrixStack ms = ctx.getMatrices();
+                  ms.push();
+                  ms.translate(x, y, 0);
+                  ms.scale(s, s, 1f);
+                  draw.run();
+                  ms.pop();
+              }
+
+              @Override
+              public void onHud(DrawContext ctx) {
+                  MinecraftClient mc = MinecraftClient.getInstance();
+                  TextRenderer tr = mc.textRenderer;
+
+                  if (watermark.value) {
+                      final String t = "HVH Client";
+                      place(ctx, wmX.value, wmY.value, wmScale.value, tr.getWidth(t), 9,
+                              () -> ctx.drawTextWithShadow(tr, t, 0, 0, 0xFF55FFFF));
+                  }
+
+                  if (modList.value) {
+                      final List<String> names = new ArrayList<>();
+                      int w = 0;
+                      for (Mod m : HvhClient.mods) {
+                          if (m.enabled && m.listed) {
+                              names.add(m.name);
+                              w = Math.max(w, tr.getWidth(m.name));
+                          }
+                      }
+                      if (!names.isEmpty()) {
+                          place(ctx, listX.value, listY.value, listScale.value, w, names.size() * 10, () -> {
+                              int y = 0;
+                              for (String n : names) {
+                                  ctx.drawTextWithShadow(tr, n, 0, y, 0xFF55FF55);
+                                  y += 10;
+                              }
+                          });
+                      }
+                  }
+
+                  if (targetHud.value) drawTarget(ctx, mc, tr);
+              }
+
+              private void drawTarget(DrawContext ctx, MinecraftClient mc, TextRenderer tr) {
+                  if (mc.player == null) return;
+                  LivingEntity t = null;
+                  long now = System.currentTimeMillis();
+                  if (mc.targetedEntity instanceof LivingEntity le && le.isAlive()) {
+                      t = le;
+                      lastTarget = le;
+                      lastTime = now;
+                  } else if (lastTarget != null && lastTarget.isAlive() && !lastTarget.isRemoved() && now - lastTime < 2000) {
+                      t = lastTarget;
+                  }
+                  if (t == null && mc.currentScreen instanceof ClickGui) t = mc.player;
+                  if (t == null) return;
+
+                  final LivingEntity tt = t;
+                  float hp = tt.getHealth() + tt.getAbsorptionAmount();
+                  float max = Math.max(1f, tt.getMaxHealth());
+                  final float ratio = MathHelper.clamp(hp / max, 0f, 1f);
+                  final int col = ratio > 0.66f ? 0xFF55FF55 : ratio > 0.33f ? 0xFFFFFF55 : 0xFFFF5555;
+                  final String name = tt.getName().getString();
+                  final String info = String.format("%.1f HP  %.1fm", hp, mc.player.distanceTo(tt));
+
+                  place(ctx, tX.value, tY.value, tScale.value, 120, 34, () -> {
+                      ctx.fill(0, 0, 120, 34, 0xAA101018);
+                      ctx.drawTextWithShadow(tr, tr.trimToWidth(name, 112), 4, 4, 0xFFFFFFFF);
+                      ctx.drawTextWithShadow(tr, info, 4, 15, 0xFFAAAAAA);
+                      ctx.fill(4, 26, 116, 30, 0xFF333333);
+                      ctx.fill(4, 26, 4 + (int) (112 * ratio), 30, col);
+                  });
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/hvh/ViewModel.java <<'EOF'
+          package com.hvh;
+
+          import net.minecraft.client.util.math.MatrixStack;
+          import net.minecraft.util.Hand;
+          import net.minecraft.util.math.RotationAxis;
+
+          public class ViewModel extends Mod {
+              public final Setting.Bool mainOnly = add(new Setting.Bool("Main Hand Only", false));
+              public final Setting.Num x = add(new Setting.Num("X", 0, -2, 2, 0.05));
+              public final Setting.Num y = add(new Setting.Num("Y", 0, -2, 2, 0.05));
+              public final Setting.Num z = add(new Setting.Num("Z", 0, -2, 2, 0.05));
+              public final Setting.Num scale = add(new Setting.Num("Scale", 1.0, 0.1, 2.0, 0.05));
+              public final Setting.Num rx = add(new Setting.Num("Rotate X", 0, -180, 180, 5));
+              public final Setting.Num ry = add(new Setting.Num("Rotate Y", 0, -180, 180, 5));
+              public final Setting.Num rz = add(new Setting.Num("Rotate Z", 0, -180, 180, 5));
+
+              public ViewModel() {
+                  super("ViewModel", "Render");
+              }
+
+              public void apply(MatrixStack m, Hand hand) {
+                  if (mainOnly.value && hand != Hand.MAIN_HAND) return;
+                  float side = hand == Hand.OFF_HAND ? -1f : 1f;
+                  m.translate(x.value * side, y.value, z.value);
+                  float s = (float) scale.value;
+                  m.scale(s, s, s);
+                  m.multiply(RotationAxis.POSITIVE_X.rotationDegrees((float) rx.value));
+                  m.multiply(RotationAxis.POSITIVE_Y.rotationDegrees((float) ry.value * side));
+                  m.multiply(RotationAxis.POSITIVE_Z.rotationDegrees((float) rz.value * side));
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/hvh/Macros.java <<'EOF'
+          package com.hvh;
+
+          import java.util.ArrayList;
+          import java.util.List;
+          import net.minecraft.client.MinecraftClient;
+
+          public class Macros extends Mod {
+              public static class Macro {
+                  public String cmd;
+                  public int key;
+
+                  public Macro(String cmd, int key) {
+                      this.cmd = cmd;
+                      this.key = key;
+                  }
+              }
+
+              public static final List<Macro> list = new ArrayList<>();
+
+              public final Setting.Button menu = add(new Setting.Button("Macro Menu", () -> {
+                  MinecraftClient mc = MinecraftClient.getInstance();
+                  mc.setScreen(new MacroScreen(mc.currentScreen));
+              }));
+
+              public Macros() {
+                  super("Macros", "Misc");
+                  enabled = true;
+                  listed = false;
+              }
+
+              @Override
+              public void onTick(MinecraftClient mc) {
+                  if (mc.getWindow() == null) return;
+                  long w = mc.getWindow().getHandle();
+                  for (Macro m : list) {
+                      boolean e = HvhClient.edge(w, m.key);
+                      if (e && mc.currentScreen == null && mc.player != null) run(mc, m.cmd);
+                  }
+              }
+
+              public static void run(MinecraftClient mc, String c) {
+                  if (mc.getNetworkHandler() == null || c == null) return;
+                  c = c.trim();
+                  if (c.isEmpty()) return;
+                  if (c.startsWith("/")) {
+                      mc.getNetworkHandler().sendChatCommand(c.substring(1));
+                  } else {
+                      mc.getNetworkHandler().sendChatMessage(c);
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/hvh/Friends.java <<'EOF'
+          package com.hvh;
+
+          import java.util.LinkedHashSet;
+          import java.util.Set;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.entity.Entity;
+          import net.minecraft.entity.player.PlayerEntity;
+          import net.minecraft.text.Text;
+          import org.lwjgl.glfw.GLFW;
+
+          public class Friends extends Mod {
+              public static final Set<String> set = new LinkedHashSet<>();
+
+              public final Setting.Bool ignore = add(new Setting.Bool("Ignore Friends", true));
+              public final Setting.Bool middleClick = add(new Setting.Bool("Middle Click", true));
+              public final Setting.Button menu = add(new Setting.Button("Friends Menu", () -> {
+                  MinecraftClient mc = MinecraftClient.getInstance();
+                  mc.setScreen(new FriendsScreen(mc.currentScreen));
+              }));
+
+              private boolean midPrev = false;
+
+              public Friends() {
+                  super("Friends", "Misc");
+                  enabled = true;
+                  listed = false;
+              }
+
+              public static boolean is(Entity e) {
+                  return e instanceof PlayerEntity p && set.contains(p.getName().getString().toLowerCase());
+              }
+
+              public static boolean ignored(Entity e) {
+                  Friends f = HvhClient.get(Friends.class);
+                  return f != null && f.enabled && f.ignore.value && is(e);
+              }
+
+              @Override
+              public void onTick(MinecraftClient mc) {
+                  if (!middleClick.value || mc.player == null || mc.getWindow() == null) return;
+                  boolean now = GLFW.glfwGetMouseButton(mc.getWindow().getHandle(), GLFW.GLFW_MOUSE_BUTTON_MIDDLE) == GLFW.GLFW_PRESS;
+                  boolean edge = now && !midPrev;
+                  midPrev = now;
+                  if (!edge || mc.currentScreen != null) return;
+                  if (mc.targetedEntity instanceof PlayerEntity p) {
+                      String n = p.getName().getString().toLowerCase();
+                      if (set.remove(n)) {
+                          mc.player.sendMessage(Text.literal("Friend removed: " + n), true);
+                      } else {
+                          set.add(n);
+                          mc.player.sendMessage(Text.literal("Friend added: " + n), true);
+                      }
+                      HvhClient.save();
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/hvh/ConfigMod.java <<'EOF'
+          package com.hvh;
+
+          import net.minecraft.client.MinecraftClient;
+
+          public class ConfigMod extends Mod {
+              public final Setting.Button menu = add(new Setting.Button("Config Menu", () -> {
+                  MinecraftClient mc = MinecraftClient.getInstance();
+                  mc.setScreen(new ConfigScreen(mc.currentScreen));
+              }));
+
+              public ConfigMod() {
+                  super("Config", "Misc");
+                  toggleable = false;
+                  listed = false;
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/hvh/Configs.java <<'EOF'
+          package com.hvh;
+
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.Properties;
+          import java.util.stream.Collectors;
+          import java.util.stream.Stream;
+          import net.fabricmc.loader.api.FabricLoader;
+
+          public class Configs {
+              public static Path dir() {
+                  Path d = FabricLoader.getInstance().getConfigDir().resolve("hvhclient").resolve("configs");
+                  try {
+                      Files.createDirectories(d);
+                  } catch (Exception ignored) {
+                  }
+                  return d;
+              }
+
+              public static String clean(String n) {
+                  if (n == null) return "";
+                  n = n.trim().replaceAll("[^A-Za-z0-9_\\-]", "_");
+                  if (n.length() > 32) n = n.substring(0, 32);
+                  return n;
+              }
+
+              public static List<String> list() {
+                  try (Stream<Path> s = Files.list(dir())) {
+                      return s.map(p -> p.getFileName().toString())
+                              .filter(f -> f.endsWith(".properties"))
+                              .map(f -> f.substring(0, f.length() - 11))
+                              .sorted()
+                              .collect(Collectors.toList());
+                  } catch (Exception e) {
+                      return new ArrayList<>();
+                  }
+              }
+
+              public static boolean save(String name) {
+                  try (OutputStream o = Files.newOutputStream(dir().resolve(name + ".properties"))) {
+                      HvhClient.buildProps().store(o, "HVH Client config: " + name);
+                      return true;
+                  } catch (Exception e) {
+                      return false;
+                  }
+              }
+
+              public static boolean load(String name) {
+                  Path f = dir().resolve(name + ".properties");
+                  if (!Files.exists(f)) return false;
+                  try (InputStream in = Files.newInputStream(f)) {
+                      Properties p = new Properties();
+                      p.load(in);
+                      HvhClient.applyProps(p);
+                      HvhClient.save();
+                      return true;
+                  } catch (Exception e) {
+                      return false;
+                  }
+              }
+
+              public static boolean delete(String name) {
+                  try {
+                      return Files.deleteIfExists(dir().resolve(name + ".properties"));
+                  } catch (Exception e) {
+                      return false;
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/hvh/HvhClient.java <<'EOF'
+          package com.hvh;
+
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.HashSet;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.Properties;
+          import java.util.Set;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
+          import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
+          import net.fabricmc.loader.api.FabricLoader;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.util.InputUtil;
+          import net.minecraft.item.AxeItem;
+          import net.minecraft.item.Item;
+          import net.minecraft.item.SwordItem;
+          import net.minecraft.registry.Registries;
+          import net.minecraft.util.Identifier;
+          import org.lwjgl.glfw.GLFW;
+
+          public class HvhClient implements ClientModInitializer {
+              public static final List<Mod> mods = new ArrayList<>();
+              public static final Set<Item> weapons = new HashSet<>();
+              public static final Map<Integer, Boolean> prev = new HashMap<>();
+              private static final Map<Integer, Boolean> cur = new HashMap<>();
+              public static int guiKey = GLFW.GLFW_KEY_RIGHT_SHIFT;
+              private static long lastNano = System.nanoTime();
+
+              @Override
+              public void onInitializeClient() {
+                  mods.add(new TriggerBot());
+                  mods.add(new AimAssist());
+                  mods.add(new HoverTotem());
+                  mods.add(new Nametags());
+                  mods.add(new Hud());
+                  mods.add(new ViewModel());
+                  mods.add(new Macros());
+                  mods.add(new Friends());
+                  mods.add(new ConfigMod());
+                  defaultWeapons();
+                  load();
+
+                  ClientTickEvents.END_CLIENT_TICK.register(HvhClient::tick);
+                  WorldRenderEvents.START.register(ctx -> frame());
+                  WorldRenderEvents.AFTER_ENTITIES.register(ctx -> {
+                      for (Mod m : mods) {
+                          if (m.enabled) m.onRender(ctx);
+                      }
+                  });
+                  HudRenderCallback.EVENT.register((ctx, tickDelta) -> {
+                      MinecraftClient mc = MinecraftClient.getInstance();
+                      if (mc.options.hudHidden) return;
+                      for (Mod m : mods) {
+                          if (m.enabled) m.onHud(ctx);
+                      }
+                  });
+              }
+
+              public static <T extends Mod> T get(Class<T> c) {
+                  for (Mod m : mods) {
+                      if (c.isInstance(m)) return c.cast(m);
+                  }
+                  return null;
+              }
+
+              public static void defaultWeapons() {
+                  weapons.clear();
+                  for (Item i : Registries.ITEM) {
+                      if (i instanceof SwordItem || i instanceof AxeItem) weapons.add(i);
+                  }
+              }
+
+              private static void tick(MinecraftClient mc) {
+                  if (mc.getWindow() == null) return;
+                  long w = mc.getWindow().getHandle();
+
+                  boolean gui = edge(w, guiKey);
+                  if (gui && mc.currentScreen == null && mc.player != null) {
+                      mc.setScreen(new ClickGui());
+                  }
+
+                  for (Mod m : mods) {
+                      if (m.toggleable) {
+                          boolean e = edge(w, m.bind);
+                          if (e && mc.currentScreen == null && mc.player != null) {
+                              m.toggle();
+                              save();
+                          }
+                      }
+                      if (m.enabled) m.onTick(mc);
+                  }
+
+                  prev.putAll(cur);
+                  cur.clear();
+              }
+
+              private static void frame() {
+                  long now = System.nanoTime();
+                  float dt = Math.min(0.1f, (now - lastNano) / 1_000_000_000f);
+                  lastNano = now;
+                  MinecraftClient mc = MinecraftClient.getInstance();
+                  for (Mod m : mods) {
+                      if (m.enabled) m.onFrame(mc, dt);
+                  }
+              }
+
+              public static boolean edge(long window, int key) {
+                  if (key < 0) return false;
+                  boolean now = InputUtil.isKeyPressed(window, key);
+                  boolean was = prev.getOrDefault(key, false);
+                  cur.put(key, now);
+                  return now && !was;
+              }
+
+              public static String keyName(int key) {
+                  if (key < 0) return "None";
+                  return InputUtil.fromKeyCode(key, 0).getLocalizedText().getString();
+              }
+
+              private static Path cfgPath() {
+                  return FabricLoader.getInstance().getConfigDir().resolve("hvhclient.properties");
+              }
+
+              public static Properties buildProps() {
+                  Properties p = new Properties();
+                  for (Mod m : mods) {
+                      p.setProperty(m.name + ".enabled", String.valueOf(m.enabled));
+                      p.setProperty(m.name + ".bind", String.valueOf(m.bind));
+                      for (Setting s : m.settings) {
+                          if (s instanceof Setting.Bool b) {
+                              p.setProperty(m.name + "." + s.name, String.valueOf(b.value));
+                          } else if (s instanceof Setting.Num n) {
+                              p.setProperty(m.name + "." + s.name, String.valueOf(n.value));
+                          }
+                      }
+                  }
+                  StringBuilder sb = new StringBuilder();
+                  for (Item i : weapons) {
+                      if (sb.length() > 0) sb.append(',');
+                      sb.append(Registries.ITEM.getId(i).toString());
+                  }
+                  p.setProperty("weapons", sb.toString());
+                  p.setProperty("friends", String.join(",", Friends.set));
+                  p.setProperty("macros.count", String.valueOf(Macros.list.size()));
+                  for (int i = 0; i < Macros.list.size(); i++) {
+                      Macros.Macro mc = Macros.list.get(i);
+                      p.setProperty("macro." + i + ".cmd", mc.cmd);
+                      p.setProperty("macro." + i + ".key", String.valueOf(mc.key));
+                  }
+                  return p;
+              }
+
+              public static void applyProps(Properties p) {
+                  for (Mod m : mods) {
+                      String en = p.getProperty(m.name + ".enabled");
+                      if (en != null) m.enabled = Boolean.parseBoolean(en);
+                      String bd = p.getProperty(m.name + ".bind");
+                      if (bd != null) {
+                          try {
+                              m.bind = Integer.parseInt(bd);
+                          } catch (Exception ignored) {
+                          }
+                      }
+                      for (Setting s : m.settings) {
+                          String v = p.getProperty(m.name + "." + s.name);
+                          if (v == null) continue;
+                          try {
+                              if (s instanceof Setting.Bool b) {
+                                  b.value = Boolean.parseBoolean(v);
+                              } else if (s instanceof Setting.Num n) {
+                                  n.value = Double.parseDouble(v);
+                              }
+                          } catch (Exception ignored) {
+                          }
+                      }
+                  }
+
+                  String w = p.getProperty("weapons");
+                  if (w != null) {
+                      weapons.clear();
+                      for (String id : w.split(",")) {
+                          if (id.isEmpty()) continue;
+                          Identifier ident = Identifier.tryParse(id);
+                          if (ident != null && Registries.ITEM.containsId(ident)) {
+                              weapons.add(Registries.ITEM.get(ident));
+                          }
+                      }
+                  }
+
+                  String fr = p.getProperty("friends");
+                  if (fr != null) {
+                      Friends.set.clear();
+                      for (String f : fr.split(",")) {
+                          if (!f.trim().isEmpty()) Friends.set.add(f.trim().toLowerCase());
+                      }
+                  }
+
+                  String cnt = p.getProperty("macros.count");
+                  if (cnt != null) {
+                      Macros.list.clear();
+                      try {
+                          int n = Integer.parseInt(cnt);
+                          for (int i = 0; i < n; i++) {
+                              String cmd = p.getProperty("macro." + i + ".cmd");
+                              if (cmd == null) continue;
+                              int key = Integer.parseInt(p.getProperty("macro." + i + ".key", "-1"));
+                              Macros.list.add(new Macros.Macro(cmd, key));
+                          }
+                      } catch (Exception ignored) {
+                      }
+                  }
+              }
+
+              public static void save() {
+                  try (OutputStream o = Files.newOutputStream(cfgPath())) {
+                      buildProps().store(o, "HVH Client");
+                  } catch (Exception ignored) {
+                  }
+              }
+
+              private static void load() {
+                  Path f = cfgPath();
+                  if (!Files.exists(f)) return;
+                  try (InputStream in = Files.newInputStream(f)) {
+                      Properties p = new Properties();
+                      p.load(in);
+                      applyProps(p);
+                  } catch (Exception ignored) {
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/hvh/ClickGui.java <<'EOF'
+          package com.hvh;
+
+          import java.util.ArrayList;
+          import java.util.List;
+          import net.minecraft.client.font.TextRenderer;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.text.Text;
+          import org.lwjgl.glfw.GLFW;
+
+          public class ClickGui extends Screen {
+              private static final int W = 150, ROW = 14, HEAD = 16, GAP = 6, TOP = 10, LEFT = 8;
+              private static final String[] CATS = {"Combat", "Render", "Misc"};
+              private static final int K_CAT = 0, K_PANEL = 1, K_HEAD = 2, K_SET = 3, K_BIND = 4;
+
+              private static class Cell {
+                  int kind, x, y, w, h;
+                  Mod mod;
+                  Setting s;
+                  String text;
+              }
+
+              private final List<Cell> cells = new ArrayList<>();
+              private Mod listening = null;
+              private int scrollX = 0, scrollY = 0, contentW = 0, contentH = 0;
+              private Runnable pending = null;
+              private boolean scrolling = false, moved = false;
+              private double pressX, pressY;
+              private Setting.Num slider = null;
+              private int sliderX = 0;
+
+              public ClickGui() {
+                  super(Text.literal("HVH Client"));
+              }
+
+              @Override
+              public boolean shouldPause() {
+                  return false;
+              }
+
+              private Cell cell(int kind, int x, int y, int w, int h, Mod m, Setting s) {
+                  Cell c = new Cell();
+                  c.kind = kind;
+                  c.x = x;
+                  c.y = y;
+                  c.w = w;
+                  c.h = h;
+                  c.mod = m;
+                  c.s = s;
+                  return c;
+              }
+
+              private void clampScroll() {
+                  int minY = Math.min(0, this.height - 24 - contentH);
+                  int minX = Math.min(0, this.width - contentW - LEFT);
+                  scrollY = Math.max(minY, Math.min(0, scrollY));
+                  scrollX = Math.max(minX, Math.min(0, scrollX));
+              }
+
+              private void layout() {
+                  clampScroll();
+                  cells.clear();
+                  int x = LEFT + scrollX;
+                  int bottom = 0;
+                  for (String cat : CATS) {
+                      Cell head = cell(K_CAT, x, TOP + scrollY, W, HEAD, null, null);
+                      head.text = cat;
+                      cells.add(head);
+                      int y = TOP + scrollY + HEAD + 2;
+                      for (Mod m : HvhClient.mods) {
+                          if (!m.category.equals(cat)) continue;
+                          int panelIdx = cells.size();
+                          cells.add(null);
+                          cells.add(cell(K_HEAD, x, y, W, HEAD, m, null));
+                          int ry = y + HEAD;
+                          if (m.expanded) {
+                              for (Setting s : m.settings) {
+                                  cells.add(cell(K_SET, x, ry, W, ROW, m, s));
+                                  ry += ROW;
+                              }
+                              if (m.toggleable) {
+                                  cells.add(cell(K_BIND, x, ry, W, ROW, m, null));
+                                  ry += ROW;
+                              }
+                          }
+                          cells.set(panelIdx, cell(K_PANEL, x, y, W, ry - y + 2, m, null));
+                          y = ry + 2 + 4;
+                      }
+                      bottom = Math.max(bottom, y - scrollY);
+                      x += W + GAP;
+                  }
+                  contentW = x - scrollX;
+                  contentH = bottom;
+              }
+
+              @Override
+              public void render(DrawContext ctx, int mx, int my, float delta) {
+                  renderBackground(ctx);
+                  layout();
+                  TextRenderer tr = this.textRenderer;
+                  for (Cell c : cells) {
+                      if (c.kind == K_CAT) {
+                          ctx.fill(c.x, c.y, c.x + c.w, c.y + c.h, 0xFF5A3EA0);
+                          ctx.drawCenteredTextWithShadow(tr, c.text, c.x + c.w / 2, c.y + 4, 0xFFFFFFFF);
+                      } else if (c.kind == K_PANEL) {
+                          ctx.fill(c.x, c.y, c.x + c.w, c.y + c.h, 0xEE101018);
+                      } else if (c.kind == K_HEAD) {
+                          Mod m = c.mod;
+                          int col = !m.toggleable ? 0xFF3A3A6A : (m.enabled ? 0xFF2E8B57 : 0xFF44444F);
+                          ctx.fill(c.x, c.y, c.x + c.w, c.y + c.h, col);
+                          String label = m.name + (m.toggleable ? (m.enabled ? "  [ON]" : "  [OFF]") : "");
+                          ctx.drawTextWithShadow(tr, label, c.x + 4, c.y + 4, 0xFFFFFFFF);
+                          ctx.drawTextWithShadow(tr, m.expanded ? "v" : ">", c.x + c.w - 10, c.y + 4, 0xFFDDDDDD);
+                      } else if (c.kind == K_SET) {
+                          drawSetting(ctx, tr, c.s, c.x, c.y);
+                      } else if (c.kind == K_BIND) {
+                          boolean l = listening == c.mod;
+                          ctx.fill(c.x, c.y, c.x + c.w, c.y + c.h, l ? 0xFF8B6B1E : 0xFF2A2A34);
+                          String bt = l ? "Bind: press a key..." : "Bind: " + HvhClient.keyName(c.mod.bind);
+                          ctx.drawTextWithShadow(tr, bt, c.x + 4, c.y + 3, 0xFFFFFFFF);
+                      }
+                  }
+                  ctx.drawTextWithShadow(tr, "Tap = toggle | v = fold | drag = scroll | RShift = close", 4, this.height - 12, 0xFFAAAAAA);
+              }
+
+              private void drawSetting(DrawContext ctx, TextRenderer tr, Setting s, int x, int y) {
+                  if (s instanceof Setting.Bool b) {
+                      ctx.fill(x, y, x + W, y + ROW, b.value ? 0xFF245A3A : 0xFF2A2A34);
+                      ctx.drawTextWithShadow(tr, s.name, x + 4, y + 3, 0xFFFFFFFF);
+                      ctx.drawTextWithShadow(tr, b.value ? "ON" : "OFF", x + W - 22, y + 3, b.value ? 0xFF55FF55 : 0xFFFF5555);
+                  } else if (s instanceof Setting.Num n) {
+                      ctx.fill(x, y, x + W, y + ROW, 0xFF2A2A34);
+                      ctx.fill(x, y, x + (int) ((W - 30) * n.fraction()), y + ROW, 0xFF3B3B7B);
+                      String val = n.infiniteTop && n.value >= n.max ? "Infinite" : fmt(n.value);
+                      ctx.drawTextWithShadow(tr, s.name + ": " + val, x + 4, y + 3, 0xFFFFFFFF);
+                      ctx.fill(x + W - 28, y + 1, x + W - 15, y + ROW - 1, 0xFF55555F);
+                      ctx.fill(x + W - 14, y + 1, x + W - 1, y + ROW - 1, 0xFF55555F);
+                      ctx.drawTextWithShadow(tr, "-", x + W - 24, y + 3, 0xFFFFFFFF);
+                      ctx.drawTextWithShadow(tr, "+", x + W - 10, y + 3, 0xFFFFFFFF);
+                  } else {
+                      ctx.fill(x, y, x + W, y + ROW, 0xFF3A3A6A);
+                      ctx.drawTextWithShadow(tr, s.name + " >", x + 4, y + 3, 0xFFFFFFFF);
+                  }
+              }
+
+              private String fmt(double v) {
+                  if (v == Math.floor(v)) return String.valueOf((int) v);
+                  return String.valueOf(Math.round(v * 100.0) / 100.0);
+              }
+
+              private boolean in(double mx, double my, int x, int y, int w, int h) {
+                  return mx >= x && mx < x + w && my >= y && my < y + h;
+              }
+
+              private Runnable actionFor(Cell c, double mx, Mod wasListening) {
+                  if (c.kind == K_HEAD) {
+                      Mod m = c.mod;
+                      if (mx >= c.x + c.w - 16) return () -> m.expanded = !m.expanded;
+                      if (m.toggleable) return m::toggle;
+                      return () -> m.expanded = !m.expanded;
+                  }
+                  if (c.kind == K_BIND) {
+                      Mod m = c.mod;
+                      return () -> listening = (wasListening == m) ? null : m;
+                  }
+                  if (c.kind == K_SET) {
+                      Setting s = c.s;
+                      if (s instanceof Setting.Bool b) return () -> b.value = !b.value;
+                      if (s instanceof Setting.Num n) {
+                          if (mx >= c.x + W - 28 && mx < c.x + W - 14) return () -> n.change(-1);
+                          if (mx >= c.x + W - 14) return () -> n.change(1);
+                          return null;
+                      }
+                      if (s instanceof Setting.Button btn) return () -> btn.action.run();
+                  }
+                  return null;
+              }
+
+              @Override
+              public boolean mouseClicked(double mx, double my, int button) {
+                  layout();
+                  pressX = mx;
+                  pressY = my;
+                  moved = false;
+                  scrolling = false;
+                  pending = null;
+                  slider = null;
+                  Mod wasListening = listening;
+                  listening = null;
+                  for (Cell c : cells) {
+                      if (c.kind == K_CAT || c.kind == K_PANEL) continue;
+                      if (!in(mx, my, c.x, c.y, c.w, c.h)) continue;
+                      if (c.kind == K_SET && c.s instanceof Setting.Num n && mx < c.x + W - 30) {
+                          slider = n;
+                          sliderX = c.x;
+                          n.setFraction((mx - c.x) / (double) (W - 30));
+                          return true;
+                      }
+                      pending = actionFor(c, mx, wasListening);
+                      return true;
+                  }
+                  scrolling = true;
+                  return true;
+              }
+
+              @Override
+              public boolean mouseDragged(double mx, double my, int button, double dx, double dy) {
+                  if (slider != null) {
+                      slider.setFraction((mx - sliderX) / (double) (W - 30));
+                      return true;
+                  }
+                  if (!moved && (Math.abs(mx - pressX) > 4 || Math.abs(my - pressY) > 4)) {
+                      moved = true;
+                      scrolling = true;
+                      pending = null;
+                  }
+                  if (scrolling) {
+                      scrollX += (int) dx;
+                      scrollY += (int) dy;
+                      clampScroll();
+                      return true;
+                  }
+                  return super.mouseDragged(mx, my, button, dx, dy);
+              }
+
+              @Override
+              public boolean mouseReleased(double mx, double my, int button) {
+                  if (pending != null && !moved) pending.run();
+                  pending = null;
+                  slider = null;
+                  scrolling = false;
+                  moved = false;
+                  return true;
+              }
+
+              @Override
+              public boolean mouseScrolled(double mx, double my, double amount) {
+                  scrollY += (int) (amount * 20);
+                  clampScroll();
+                  return true;
+              }
+
+              @Override
+              public boolean keyPressed(int key, int scan, int modifiers) {
+                  if (listening != null) {
+                      if (key == GLFW.GLFW_KEY_ESCAPE) {
+                          listening = null;
+                          return true;
+                      }
+                      if (key == GLFW.GLFW_KEY_BACKSPACE || key == GLFW.GLFW_KEY_DELETE) {
+                          listening.bind = -1;
+                      } else {
+                          listening.bind = key;
+                      }
+                      listening = null;
+                      return true;
+                  }
+                  if (key == HvhClient.guiKey) {
+                      HvhClient.prev.put(key, true);
+                      close();
+                      return true;
+                  }
+                  return super.keyPressed(key, scan, modifiers);
+              }
+
+              @Override
+              public void removed() {
+                  HvhClient.save();
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/hvh/ListScreen.java <<'EOF'
+          package com.hvh;
+
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.TextFieldWidget;
+          import net.minecraft.text.Text;
+
+          public abstract class ListScreen extends Screen {
+              protected static final int ROW = 20;
+              protected final Screen parent;
+              protected TextFieldWidget field;
+              protected int scroll = 0;
+
+              private boolean pressed = false;
+              private boolean dragged = false;
+              private int pressIdx = -1;
+              private double dragAcc = 0;
+              private double pressX = 0;
+
+              protected ListScreen(String title, Screen parent) {
+                  super(Text.literal(title));
+                  this.parent = parent;
+              }
+
+              protected abstract int count();
+
+              protected abstract void drawRow(DrawContext ctx, int idx, int x, int y, int w);
+
+              protected abstract void tapRow(int idx, double mx, int rowX);
+
+              protected void makeField(int maxLen, String hint) {
+                  field = new TextFieldWidget(this.textRenderer, this.width / 2 - 100, 22, 200, 18, Text.literal(""));
+                  field.setMaxLength(maxLen);
+                  field.setSuggestion(hint);
+                  field.setChangedListener(s -> field.setSuggestion(s.isEmpty() ? hint : ""));
+                  addDrawableChild(field);
+              }
+
+              protected int listTop() {
+                  return 68;
+              }
+
+              protected int listX() {
+                  return this.width / 2 - 140;
+              }
+
+              protected int listW() {
+                  return 280;
+              }
+
+              protected int visibleRows() {
+                  return Math.max(1, (this.height - 6 - listTop()) / ROW);
+              }
+
+              protected void clampScroll() {
+                  int max = Math.max(0, count() - visibleRows());
+                  if (scroll > max) scroll = max;
+                  if (scroll < 0) scroll = 0;
+              }
+
+              protected void scrollToEnd() {
+                  scroll = Math.max(0, count() - visibleRows());
+              }
+
+              protected void drawList(DrawContext ctx) {
+                  clampScroll();
+                  int top = listTop();
+                  int rows = visibleRows();
+                  for (int i = 0; i < rows; i++) {
+                      int idx = scroll + i;
+                      if (idx >= count()) break;
+                      drawRow(ctx, idx, listX(), top + i * ROW, listW());
+                  }
+              }
+
+              private boolean inList(double mx, double my) {
+                  int x = listX();
+                  return mx >= x && mx < x + listW() && my >= listTop();
+              }
+
+              @Override
+              public boolean mouseClicked(double mx, double my, int button) {
+                  if (super.mouseClicked(mx, my, button)) return true;
+                  if (inList(mx, my)) {
+                      int row = (int) ((my - listTop()) / ROW);
+                      if (row < visibleRows()) {
+                          pressed = true;
+                          dragged = false;
+                          dragAcc = 0;
+                          pressX = mx;
+                          pressIdx = row + scroll;
+                          return true;
+                      }
+                  }
+                  return false;
+              }
+
+              @Override
+              public boolean mouseDragged(double mx, double my, int button, double dx, double dy) {
+                  if (pressed) {
+                      if (Math.abs(dy) > 0) dragged = true;
+                      dragAcc += dy;
+                      while (dragAcc <= -ROW) {
+                          scroll++;
+                          dragAcc += ROW;
+                      }
+                      while (dragAcc >= ROW) {
+                          scroll--;
+                          dragAcc -= ROW;
+                      }
+                      clampScroll();
+                      return true;
+                  }
+                  return super.mouseDragged(mx, my, button, dx, dy);
+              }
+
+              @Override
+              public boolean mouseReleased(double mx, double my, int button) {
+                  if (pressed) {
+                      pressed = false;
+                      if (!dragged && pressIdx >= 0 && pressIdx < count()) {
+                          tapRow(pressIdx, pressX, listX());
+                      }
+                      return true;
+                  }
+                  return super.mouseReleased(mx, my, button);
+              }
+
+              @Override
+              public boolean mouseScrolled(double mx, double my, double amount) {
+                  scroll -= (int) Math.signum(amount) * 3;
+                  clampScroll();
+                  return true;
+              }
+
+              @Override
+              public void close() {
+                  this.client.setScreen(parent);
+              }
+
+              @Override
+              public void removed() {
+                  HvhClient.save();
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/hvh/MacroScreen.java <<'EOF'
+          package com.hvh;
+
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.text.Text;
+          import org.lwjgl.glfw.GLFW;
+
+          public class MacroScreen extends ListScreen {
+              private int listening = -1;
+
+              public MacroScreen(Screen parent) {
+                  super("Macros", parent);
+              }
+
+              @Override
+              protected void init() {
+                  makeField(256, "command (e.g. /kit pvp)");
+                  int bx = this.width / 2 - 140;
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Back"), b -> close())
+                          .dimensions(bx, 44, 136, 18).build());
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Add"), b -> addMacro())
+                          .dimensions(bx + 144, 44, 136, 18).build());
+              }
+
+              private void addMacro() {
+                  String t = field.getText().trim();
+                  if (t.isEmpty()) return;
+                  Macros.list.add(new Macros.Macro(t, -1));
+                  field.setText("");
+                  listening = Macros.list.size() - 1;
+                  scrollToEnd();
+                  HvhClient.save();
+              }
+
+              @Override
+              protected int count() {
+                  return Macros.list.size();
+              }
+
+              @Override
+              protected void drawRow(DrawContext ctx, int idx, int x, int y, int w) {
+                  Macros.Macro m = Macros.list.get(idx);
+                  ctx.fill(x, y, x + w, y + ROW - 2, 0xFF2A2A34);
+                  ctx.fill(x, y, x + 72, y + ROW - 2, listening == idx ? 0xFF8B6B1E : 0xFF3A3A6A);
+                  String k = listening == idx ? "press key..." : (m.key < 0 ? "No key" : HvhClient.keyName(m.key));
+                  ctx.drawTextWithShadow(this.textRenderer, this.textRenderer.trimToWidth(k, 66), x + 4, y + 5, 0xFFFFFFFF);
+                  ctx.drawTextWithShadow(this.textRenderer, this.textRenderer.trimToWidth(m.cmd, w - 72 - 28), x + 76, y + 5, 0xFFFFFFFF);
+                  ctx.fill(x + w - 18, y, x + w, y + ROW - 2, 0xFF7A2A2A);
+                  ctx.drawTextWithShadow(this.textRenderer, "x", x + w - 12, y + 5, 0xFFFFFFFF);
+              }
+
+              @Override
+              protected void tapRow(int idx, double mx, int rowX) {
+                  if (mx < rowX + 72) {
+                      listening = (listening == idx) ? -1 : idx;
+                  } else if (mx >= rowX + listW() - 18) {
+                      Macros.list.remove(idx);
+                      listening = -1;
+                      HvhClient.save();
+                  }
+              }
+
+              @Override
+              public void render(DrawContext ctx, int mx, int my, float delta) {
+                  renderBackground(ctx);
+                  ctx.drawCenteredTextWithShadow(this.textRenderer, "Macros (" + Macros.list.size() + ") - tap key box to bind, x = delete", this.width / 2, 8, 0xFFFFFFFF);
+                  drawList(ctx);
+                  super.render(ctx, mx, my, delta);
+              }
+
+              @Override
+              public boolean keyPressed(int key, int scan, int modifiers) {
+                  if (listening >= 0) {
+                      if (key == GLFW.GLFW_KEY_ESCAPE) {
+                          listening = -1;
+                      } else if (listening < Macros.list.size()) {
+                          Macros.list.get(listening).key = (key == GLFW.GLFW_KEY_BACKSPACE || key == GLFW.GLFW_KEY_DELETE) ? -1 : key;
+                          listening = -1;
+                          HvhClient.save();
+                      } else {
+                          listening = -1;
+                      }
+                      return true;
+                  }
+                  if ((key == GLFW.GLFW_KEY_ENTER || key == GLFW.GLFW_KEY_KP_ENTER) && field.isFocused()) {
+                      addMacro();
+                      return true;
+                  }
+                  return super.keyPressed(key, scan, modifiers);
+              }
+
+              @Override
+              public boolean charTyped(char chr, int modifiers) {
+                  if (listening >= 0) return true;
+                  return super.charTyped(chr, modifiers);
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/hvh/FriendsScreen.java <<'EOF'
+          package com.hvh;
+
+          import java.util.ArrayList;
+          import java.util.Comparator;
+          import java.util.LinkedHashMap;
+          import java.util.List;
+          import java.util.Map;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.client.network.ClientPlayNetworkHandler;
+          import net.minecraft.client.network.PlayerListEntry;
+          import net.minecraft.text.Text;
+          import org.lwjgl.glfw.GLFW;
+
+          public class FriendsScreen extends ListScreen {
+              private final List<String[]> rows = new ArrayList<>();
+
+              public FriendsScreen(Screen parent) {
+                  super("Friends", parent);
+              }
+
+              @Override
+              protected void init() {
+                  makeField(32, "search / type a name");
+                  int bx = this.width / 2 - 140;
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Back"), b -> close())
+                          .dimensions(bx, 44, 136, 18).build());
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Add typed name"), b -> addTyped())
+                          .dimensions(bx + 144, 44, 136, 18).build());
+                  rebuild();
+              }
+
+              private void addTyped() {
+                  String n = field.getText().trim().toLowerCase().replace(" ", "");
+                  if (n.isEmpty()) return;
+                  Friends.set.add(n);
+                  field.setText("");
+                  HvhClient.save();
+              }
+
+              private void rebuild() {
+                  String q = field == null ? "" : field.getText().toLowerCase().trim();
+                  Map<String, String> map = new LinkedHashMap<>();
+                  ClientPlayNetworkHandler nh = this.client == null ? null : this.client.getNetworkHandler();
+                  if (nh != null) {
+                      for (PlayerListEntry e : nh.getPlayerList()) {
+                          String n = e.getProfile().getName();
+                          map.put(n.toLowerCase(), n);
+                      }
+                  }
+                  for (String f : Friends.set) map.putIfAbsent(f, f);
+                  rows.clear();
+                  for (Map.Entry<String, String> en : map.entrySet()) {
+                      if (!q.isEmpty() && !en.getKey().contains(q)) continue;
+                      rows.add(new String[] { en.getKey(), en.getValue() });
+                  }
+                  rows.sort(Comparator.comparing((String[] r) -> !Friends.set.contains(r[0])).thenComparing(r -> r[0]));
+              }
+
+              @Override
+              protected int count() {
+                  return rows.size();
+              }
+
+              @Override
+              protected void drawRow(DrawContext ctx, int idx, int x, int y, int w) {
+                  String[] r = rows.get(idx);
+                  boolean fr = Friends.set.contains(r[0]);
+                  ctx.fill(x, y, x + w, y + ROW - 2, fr ? 0xFF245A3A : 0xFF2A2A34);
+                  ctx.drawTextWithShadow(this.textRenderer, r[1], x + 6, y + 5, 0xFFFFFFFF);
+                  ctx.drawTextWithShadow(this.textRenderer, fr ? "FRIEND" : "-", x + w - 48, y + 5, fr ? 0xFF55FF55 : 0xFF888888);
+              }
+
+              @Override
+              protected void tapRow(int idx, double mx, int rowX) {
+                  String key = rows.get(idx)[0];
+                  if (!Friends.set.remove(key)) Friends.set.add(key);
+                  HvhClient.save();
+              }
+
+              @Override
+              public void render(DrawContext ctx, int mx, int my, float delta) {
+                  renderBackground(ctx);
+                  rebuild();
+                  ctx.drawCenteredTextWithShadow(this.textRenderer, "Friends (" + Friends.set.size() + ") - tap a name to toggle", this.width / 2, 8, 0xFFFFFFFF);
+                  drawList(ctx);
+                  super.render(ctx, mx, my, delta);
+              }
+
+              @Override
+              public boolean keyPressed(int key, int scan, int modifiers) {
+                  if ((key == GLFW.GLFW_KEY_ENTER || key == GLFW.GLFW_KEY_KP_ENTER) && field.isFocused()) {
+                      addTyped();
+                      return true;
+                  }
+                  return super.keyPressed(key, scan, modifiers);
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/hvh/ConfigScreen.java <<'EOF'
+          package com.hvh;
+
+          import java.util.ArrayList;
+          import java.util.List;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.text.Text;
+
+          public class ConfigScreen extends ListScreen {
+              private List<String> names = new ArrayList<>();
+              private String status = "";
+
+              public ConfigScreen(Screen parent) {
+                  super("Configs", parent);
+              }
+
+              @Override
+              protected void init() {
+                  makeField(32, "config name");
+                  int bx = this.width / 2 - 140;
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Back"), b -> close())
+                          .dimensions(bx, 44, 66, 18).build());
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Save"), b -> doSave())
+                          .dimensions(bx + 71, 44, 66, 18).build());
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Load"), b -> doLoad())
+                          .dimensions(bx + 142, 44, 66, 18).build());
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Delete"), b -> doDelete())
+                          .dimensions(bx + 213, 44, 66, 18).build());
+                  refresh();
+              }
+
+              private void refresh() {
+                  names = Configs.list();
+              }
+
+              private String name() {
+                  return Configs.clean(field.getText());
+              }
+
+              private void doSave() {
+                  String n = name();
+                  if (n.isEmpty()) {
+                      status = "Enter a name first";
+                      return;
+                  }
+                  status = Configs.save(n) ? "Saved: " + n : "Save failed";
+                  refresh();
+              }
+
+              private void doLoad() {
+                  String n = name();
+                  if (n.isEmpty()) {
+                      status = "Pick or type a config";
+                      return;
+                  }
+                  status = Configs.load(n) ? "Loaded: " + n : "Not found: " + n;
+              }
+
+              private void doDelete() {
+                  String n = name();
+                  if (n.isEmpty()) {
+                      status = "Pick or type a config";
+                      return;
+                  }
+                  status = Configs.delete(n) ? "Deleted: " + n : "Not found: " + n;
+                  refresh();
+              }
+
+              @Override
+              protected int listTop() {
+                  return 82;
+              }
+
+              @Override
+              protected int count() {
+                  return names.size();
+              }
+
+              @Override
+              protected void drawRow(DrawContext ctx, int idx, int x, int y, int w) {
+                  String n = names.get(idx);
+                  boolean sel = n.equals(name());
+                  ctx.fill(x, y, x + w, y + ROW - 2, sel ? 0xFF245A3A : 0xFF2A2A34);
+                  ctx.drawTextWithShadow(this.textRenderer, n, x + 6, y + 5, 0xFFFFFFFF);
+              }
+
+              @Override
+              protected void tapRow(int idx, double mx, int rowX) {
+                  field.setText(names.get(idx));
+              }
+
+              @Override
+              public void render(DrawContext ctx, int mx, int my, float delta) {
+                  renderBackground(ctx);
+                  ctx.drawCenteredTextWithShadow(this.textRenderer, "Configs (" + names.size() + ") - tap one, then Load", this.width / 2, 8, 0xFFFFFFFF);
+                  ctx.drawCenteredTextWithShadow(this.textRenderer, status, this.width / 2, 68, 0xFFFFFF55);
+                  drawList(ctx);
+                  super.render(ctx, mx, my, delta);
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/hvh/WeaponsScreen.java <<'EOF'
+          package com.hvh;
+
+          import java.util.ArrayList;
+          import java.util.Comparator;
+          import java.util.List;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.client.gui.widget.TextFieldWidget;
+          import net.minecraft.item.Item;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.item.Items;
+          import net.minecraft.registry.Registries;
+          import net.minecraft.text.Text;
+
+          public class WeaponsScreen extends Screen {
+              private static final int ROW = 20;
+              private final Screen parent;
+              private TextFieldWidget search;
+              private final List<Item> list = new ArrayList<>();
+              private String lastQuery = "";
+              private boolean selectedOnly = false;
+              private int scroll = 0;
+
+              private boolean pressedList = false;
+              private boolean dragged = false;
+              private int pressIdx = -1;
+              private double dragAcc = 0;
+
+              public WeaponsScreen(Screen parent) {
+                  super(Text.literal("Weapons"));
+                  this.parent = parent;
+              }
+
+              @Override
+              protected void init() {
+                  search = new TextFieldWidget(this.textRenderer, this.width / 2 - 100, 22, 200, 18, Text.literal("Search"));
+                  addDrawableChild(search);
+
+                  int bx = this.width / 2 - 138;
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Back"), b -> close())
+                          .dimensions(bx, 44, 90, 18).build());
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Selected: " + (selectedOnly ? "ON" : "OFF")), b -> {
+                      selectedOnly = !selectedOnly;
+                      b.setMessage(Text.literal("Selected: " + (selectedOnly ? "ON" : "OFF")));
+                      rebuild();
+                  }).dimensions(bx + 93, 44, 90, 18).build());
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Reset"), b -> {
+                      HvhClient.defaultWeapons();
+                      rebuild();
+                  }).dimensions(bx + 186, 44, 90, 18).build());
+
+                  rebuild();
+              }
+
+              private int listTop() {
+                  return 68;
+              }
+
+              private int visibleRows() {
+                  return Math.max(1, (this.height - 6 - listTop()) / ROW);
+              }
+
+              private void rebuild() {
+                  String q = search == null ? "" : search.getText().toLowerCase().trim();
+                  lastQuery = q;
+                  list.clear();
+                  for (Item it : Registries.ITEM) {
+                      if (it == Items.AIR) continue;
+                      boolean sel = HvhClient.weapons.contains(it);
+                      if (selectedOnly && !sel) continue;
+                      if (!q.isEmpty()) {
+                          String n = it.getName().getString().toLowerCase();
+                          String id = Registries.ITEM.getId(it).getPath();
+                          if (!n.contains(q) && !id.contains(q)) continue;
+                      }
+                      list.add(it);
+                  }
+                  list.sort(Comparator.comparing((Item i) -> !HvhClient.weapons.contains(i)));
+                  scroll = 0;
+              }
+
+              private void clampScroll() {
+                  int max = Math.max(0, list.size() - visibleRows());
+                  if (scroll > max) scroll = max;
+                  if (scroll < 0) scroll = 0;
+              }
+
+              @Override
+              public void render(DrawContext ctx, int mx, int my, float delta) {
+                  renderBackground(ctx);
+                  ctx.drawCenteredTextWithShadow(this.textRenderer, "Weapons (" + HvhClient.weapons.size() + " selected) - tap to toggle", this.width / 2, 8, 0xFFFFFFFF);
+
+                  String q = search.getText().toLowerCase().trim();
+                  if (!q.equals(lastQuery)) rebuild();
+                  clampScroll();
+
+                  int x = this.width / 2 - 140;
+                  int w = 280;
+                  int top = listTop();
+                  int rows = visibleRows();
+                  for (int i = 0; i < rows; i++) {
+                      int idx = scroll + i;
+                      if (idx >= list.size()) break;
+                      Item it = list.get(idx);
+                      int y = top + i * ROW;
+                      boolean sel = HvhClient.weapons.contains(it);
+                      ctx.fill(x, y, x + w, y + ROW - 2, sel ? 0xFF245A3A : 0xFF2A2A34);
+                      ctx.drawItem(new ItemStack(it), x + 2, y + 1);
+                      ctx.drawTextWithShadow(this.textRenderer, it.getName().getString(), x + 24, y + 5, 0xFFFFFFFF);
+                      ctx.drawTextWithShadow(this.textRenderer, sel ? "WEAPON" : "-", x + w - 48, y + 5, sel ? 0xFF55FF55 : 0xFF888888);
+                  }
+
+                  super.render(ctx, mx, my, delta);
+
+                  if (search.getText().isEmpty() && !search.isFocused()) {
+                      ctx.drawTextWithShadow(this.textRenderer, "Search...", this.width / 2 - 96, 27, 0xFF888888);
+                  }
+              }
+
+              private boolean inList(double mx, double my) {
+                  int x = this.width / 2 - 140;
+                  return mx >= x && mx < x + 280 && my >= listTop();
+              }
+
+              @Override
+              public boolean mouseClicked(double mx, double my, int button) {
+                  if (super.mouseClicked(mx, my, button)) return true;
+                  if (inList(mx, my)) {
+                      int row = (int) ((my - listTop()) / ROW);
+                      if (row < visibleRows()) {
+                          pressedList = true;
+                          dragged = false;
+                          dragAcc = 0;
+                          pressIdx = row + scroll;
+                          return true;
+                      }
+                  }
+                  return false;
+              }
+
+              @Override
+              public boolean mouseDragged(double mx, double my, int button, double dx, double dy) {
+                  if (pressedList) {
+                      if (Math.abs(dy) > 0) dragged = true;
+                      dragAcc += dy;
+                      while (dragAcc <= -ROW) {
+                          scroll++;
+                          dragAcc += ROW;
+                      }
+                      while (dragAcc >= ROW) {
+                          scroll--;
+                          dragAcc -= ROW;
+                      }
+                      clampScroll();
+                      return true;
+                  }
+                  return super.mouseDragged(mx, my, button, dx, dy);
+              }
+
+              @Override
+              public boolean mouseReleased(double mx, double my, int button) {
+                  if (pressedList) {
+                      pressedList = false;
+                      if (!dragged && pressIdx >= 0 && pressIdx < list.size()) {
+                          Item it = list.get(pressIdx);
+                          if (!HvhClient.weapons.remove(it)) HvhClient.weapons.add(it);
+                      }
+                      return true;
+                  }
+                  return super.mouseReleased(mx, my, button);
+              }
+
+              @Override
+              public boolean mouseScrolled(double mx, double my, double amount) {
+                  scroll -= (int) Math.signum(amount) * 3;
+                  clampScroll();
+                  return true;
+              }
+
+              @Override
+              public void close() {
+                  this.client.setScreen(parent);
+              }
+
+              @Override
+              public void removed() {
+                  HvhClient.save();
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/hvh/mixin/HeldItemRendererMixin.java <<'EOF'
+          package com.hvh.mixin;
+
+          import com.hvh.HvhClient;
+          import com.hvh.ViewModel;
+          import net.minecraft.client.network.AbstractClientPlayerEntity;
+          import net.minecraft.client.render.VertexConsumerProvider;
+          import net.minecraft.client.render.item.HeldItemRenderer;
+          import net.minecraft.client.util.math.MatrixStack;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.util.Hand;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+          @Mixin(HeldItemRenderer.class)
+          public class HeldItemRendererMixin {
+              @Inject(method = "renderFirstPersonItem", at = @At("HEAD"))
+              private void hvh$viewModel(AbstractClientPlayerEntity player, float tickDelta, float pitch, Hand hand,
+                                         float swingProgress, ItemStack item, float equipProgress, MatrixStack matrices,
+                                         VertexConsumerProvider vertexConsumers, int light, CallbackInfo ci) {
+                  ViewModel vm = HvhClient.get(ViewModel.class);
+                  if (vm != null && vm.enabled) vm.apply(matrices, hand);
+              }
+          }
+          EOF
+
+      - run: gradle build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HVH-Client
+          path: build/libs/HVH-Client-1.0.0.jar
